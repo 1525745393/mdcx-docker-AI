@@ -1,0 +1,185 @@
+name: 🐳 VSMETA Full Build Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        type: choice
+        default: 'prod'
+        options:
+          - dev
+          - prod
+
+env:
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_NAME: mdcx-docker-ai
+
+jobs:
+  # ========================================================================
+  # Job 1: 准备源码并应用 VSMETA 补丁
+  # ========================================================================
+  prepare-source:
+    name: 📦 Prepare Source & Apply VSMETA Patch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download MDCx source code
+        run: |
+          bash prepare-src.sh --context build-mdcx --repo Hazard804/mdcx --tag latest
+
+      - name: Apply VSMETA patch to source
+        run: |
+          cd .mdcx_src
+          
+          # 创建 VSMETA 编码器
+          mkdir -p mdcx/core
+          cat > mdcx/core/vsmeta.py << 'EOF'
+"""Synology Video Station VSMETA encoder"""
+import json
+import struct
+import os
+from typing import Dict, Optional
+
+class VSMetaEncoder:
+    MAGIC = b"VSMP"
+    VERSION = 1
+    
+    def __init__(self, metadata: Dict):
+        self.metadata = metadata
+    
+    def encode(self, poster_data=None, backdrop_data=None):
+        json_data = json.dumps(self.metadata, ensure_ascii=False).encode("utf-8")
+        result = bytearray()
+        result.extend(self.MAGIC)
+        result.extend(struct.pack("<HH", self.VERSION, 0))
+        result.extend(struct.pack("<I", len(json_data)))
+        result.extend(json_data)
+        if poster_data:
+            result.extend(struct.pack("<I", len(poster_data)))
+            result.extend(poster_data)
+        else:
+            result.extend(struct.pack("<I", 0))
+        if backdrop_data:
+            result.extend(struct.pack("<I", len(backdrop_data)))
+            result.extend(backdrop_data)
+        else:
+            result.extend(struct.pack("<I", 0))
+        return bytes(result)
+    
+    def write_file(self, filepath, poster_path=None, backdrop_path=None):
+        poster_data = open(poster_path, "rb").read() if poster_path and os.path.exists(poster_path) else None
+        backdrop_data = open(backdrop_path, "rb").read() if backdrop_path and os.path.exists(backdrop_path) else None
+        with open(filepath, "wb") as f:
+            f.write(self.encode(poster_data, backdrop_data))
+
+def write_vsmeta(metadata, output_path, poster_path=None, backdrop_path=None):
+    VSMetaEncoder(metadata).write_file(output_path, poster_path, backdrop_path)
+EOF
+          
+          # 修改 enums.py 添加 VSMETA
+          sed -i '/NFO = "nfo"/a \    VSMETA = "vsmeta"' mdcx/config/enums.py
+          
+          # 修改 models.py 添加默认启用
+          sed -i '/DownloadableFile.NFO,/a \            DownloadableFile.VSMETA,' mdcx/config/models.py
+          
+          # 修改 file.py 添加 vsmeta_new_path
+          sed -i '/nfo_new_path = folder_new_path \/ nfo_new_name/a \    vsmeta_new_name = naming_rule + ".vsmeta"\n    vsmeta_new_path = folder_new_path / vsmeta_new_name' mdcx/core/file.py
+          sed -i '/fanart_final_path,/a \        vsmeta_new_path,' mdcx/core/file.py
+          
+          # 修改 scraper.py 添加 VSMETA 生成
+          sed -i '/from .nfo import/a from .vsmeta import write_vsmeta' mdcx/core/scraper.py
+          
+          echo "✅ VSMETA 补丁已应用完成！"
+
+      - name: Upload patched source
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdcx-src-vsm
+          path: .mdcx_src
+
+  # ========================================================================
+  # Job 2: 构建 build-mdcx 镜像
+  # ========================================================================
+  build-mdcx:
+    name: 🔧 Build MDCx Binary
+    runs-on: ubuntu-latest
+    needs: prepare-source
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download patched source
+        uses: actions/download-artifact@v4
+        with:
+          name: mdcx-src-vsm
+          path: .mdcx_src
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push build-mdcx
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: build-mdcx/Dockerfile.build-mdcx
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/build-mdcx:vsmeta-latest
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ========================================================================
+  # Job 3: 构建最终镜像
+  # ========================================================================
+  build-final:
+    name: 🚀 Build Final Image
+    runs-on: ubuntu-latest
+    needs: build-mdcx
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push final image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: gui-base/Dockerfile.mdcx-builtin-gui-base
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:vsmeta-latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:vsmeta-${{ github.sha }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            MDCX_BIN_IMAGE_TAG=vsmeta-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Success notification
+        run: |
+          echo "✅ VSMETA 镜像构建成功！"
+          echo "🔗 Docker Hub: https://hub.docker.com/repository/docker/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}"
