@@ -9,14 +9,8 @@ on:
       - develop
     tags:
       - 'vsmeta-*'
-    paths:
-      - 'mdcx/core/vsmeta.py'
-      - 'mdcx/config/enums.py'
-      - 'mdcx/config/models.py'
-      - 'mdcx/core/scraper.py'
-      - 'mdcx/core/file.py'
-      - 'mdcx/tests/core/test_vsmeta.py'
-      - '.github/workflows/vsmeta-full-ci-cd.yml'
+    paths-ignore:
+      - '*.md'
 
   workflow_dispatch:
     inputs:
