@@ -1,0 +1,57 @@
+name: 🐳 VSMETA Build & Push
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        type: choice
+        default: 'prod'
+        options:
+          - dev
+          - prod
+
+env:
+  VSMETA_VERSION: vsmeta-${{ github.sha }}
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+
+jobs:
+  build-and-push:
+    name: 📦 Build and Push VSMETA Image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set version tag
+        run: |
+          VERSION="vsmeta-$(date +%Y%m%d)"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "LATEST_TAG=vsmeta-latest" >> $GITHUB_ENV
+
+      - name: Build and push mdcx-builtin-gui-base
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: gui-base/Dockerfile.mdcx-builtin-gui-base
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/mdcx-docker-ai:${{ env.VERSION }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/mdcx-docker-ai:${{ env.LATEST_TAG }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Notify success
+        run: |
+          echo "✅ VSMETA 镜像构建成功！"
+          echo "🔗 Docker Hub: https://hub.docker.com/repository/docker/${{ secrets.DOCKERHUB_USERNAME }}/mdcx-docker-ai"
