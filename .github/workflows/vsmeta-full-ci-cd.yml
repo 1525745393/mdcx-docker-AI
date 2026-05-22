@@ -1,0 +1,591 @@
+name: 🐳 MDCx VSMETA - Full CI/CD Pipeline
+
+run-name: VSMETA CI/CD [Stage: ${{ inputs.environment || 'prod' }}]
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'vsmeta-*'
+    paths:
+      - 'mdcx/core/vsmeta.py'
+      - 'mdcx/config/enums.py'
+      - 'mdcx/config/models.py'
+      - 'mdcx/core/scraper.py'
+      - 'mdcx/core/file.py'
+      - 'mdcx/tests/core/test_vsmeta.py'
+      - '.github/workflows/vsmeta-full-ci-cd.yml'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        type: choice
+        default: 'prod'
+        options:
+          - dev
+          - prod
+      skip_tests:
+        description: 'Skip Tests'
+        type: boolean
+        default: false
+      skip_build:
+        description: 'Skip Build'
+        type: boolean
+        default: false
+
+env:
+  VSMETA_VERSION: vsmeta-$(date +%Y%m%d-%H%M%S)
+  DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+  PYPI_MIRROR: https://pypi.org/simple
+
+jobs:
+  # ========================================================================
+  # Job 1: 环境准备和代码检查
+  # ========================================================================
+  environment-preparation:
+    name: 📦 Environment & Code Check
+    runs-on: ubuntu-latest
+    outputs:
+      should_continue: ${{ steps.check-changes.outputs.should_continue }}
+      is_vsmeta_release: ${{ steps.check-changes.outputs.is_vsmeta_release }}
+      environment: ${{ inputs.environment || 'prod' }}
+      skip_tests: ${{ inputs.skip_tests || false }}
+      skip_build: ${{ inputs.skip_build || false }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for VSMETA related changes
+        id: check-changes
+        run: |
+          echo "检查 VSMETA 相关变更..."
+
+          # 检查是否有 VSMETA 相关的文件变更
+          CHANGED_FILES=$(git diff --name-only origin/main...HEAD 2>/dev/null || echo "")
+
+          echo "变更的文件: $CHANGED_FILES"
+          echo ""
+
+          # VSMETA 相关的文件列表
+          VSMETA_FILES=(
+            "mdcx/core/vsmeta.py"
+            "mdcx/config/enums.py"
+            "mdcx/config/models.py"
+            "mdcx/core/scraper.py"
+            "mdcx/core/file.py"
+            "mdcx/tests/core/test_vsmeta.py"
+          )
+
+          SHOULD_CONTINUE="false"
+          IS_VSMETA_RELEASE="false"
+
+          for file in "${VSMETA_FILES[@]}"; do
+            if echo "$CHANGED_FILES" | grep -q "$file"; then
+              echo "✅ 发现变更: $file"
+              SHOULD_CONTINUE="true"
+              IS_VSMETA_RELEASE="true"
+            fi
+          done
+
+          # 如果是手动触发或者 VSMETA 相关的 PR/分支，也应该继续
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+             [[ "${{ github.ref }}" == *"vsmeta"* ]] || \
+             [[ "${{ github.head_ref}}" == *"vsmeta"* ]]; then
+            SHOULD_CONTINUE="true"
+            IS_VSMETA_RELEASE="true"
+          fi
+
+          echo "should_continue=$SHOULD_CONTINUE" >> $GITHUB_OUTPUT
+          echo "is_vsmeta_release=$IS_VSMETA_RELEASE" >> $GITHUB_OUTPUT
+
+      - name: Display environment info
+        run: |
+          echo "========================================="
+          echo "  MDCx VSMETA CI/CD 环境信息"
+          echo "========================================="
+          echo "GitHub Event: ${{ github.event_name }}"
+          echo "Branch/Tag: ${{ github.ref }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Environment: ${{ inputs.environment || 'prod' }}"
+          echo "Should Continue: ${{ steps.check-changes.outputs.should_continue }}"
+          echo "Is VSMETA Release: ${{ steps.check-changes.outputs.is_vsmeta_release }}"
+          echo "========================================="
+
+      - name: Generate version tag
+        id: version
+        run: |
+          if [[ "${{ inputs.environment || 'prod' }}" == "dev" ]]; then
+            echo "version=vsmeta-dev-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          else
+            echo "version=vsmeta-$(date +%Y%m%d)" >> $GITHUB_OUTPUT
+          fi
+
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+  # ========================================================================
+  # Job 2: 代码质量检查和 Lint
+  # ========================================================================
+  code-quality:
+    name: 🔍 Code Quality & Lint
+    runs-on: ubuntu-latest
+    needs: environment-preparation
+    if: needs.environment-preparation.outputs.should_continue == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv sync --group dev
+
+      - name: Run Ruff lint
+        run: |
+          uv run ruff check mdcx/
+
+      - name: Run Ruff format check
+        run: |
+          uv run ruff format --check mdcx/
+
+  # ========================================================================
+  # Job 3: 单元测试
+  # ========================================================================
+  unit-tests:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+    needs: [environment-preparation, code-quality]
+    if: |
+      needs.environment-preparation.outputs.should_continue == 'true' &&
+      needs.environment-preparation.outputs.skip_tests != 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install dependencies
+        run: |
+          uv sync --group dev
+
+      - name: Run VSMETA unit tests
+        run: |
+          uv run pytest mdcx/tests/core/test_vsmeta.py -v
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            .pytest_cache/
+            *.py.result
+
+  # ========================================================================
+  # Job 4: 构建 Docker 镜像 - Base
+  # ========================================================================
+  build-base:
+    name: 🏗️ Build Base Image
+    runs-on: ubuntu-latest
+    needs: [environment-preparation]
+    if: |
+      needs.environment-preparation.outputs.should_continue == 'true' &&
+      needs.environment-preparation.outputs.skip_build != 'true'
+
+    outputs:
+      image_tag: ${{ steps.build.outputs.tag }}
+      build_version: ${{ needs.environment-preparation.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Prepare build args
+        id: build-args
+        run: |
+          if [[ "${{ needs.environment-preparation.outputs.environment }}" == "dev" ]]; then
+            echo "base_tag=${{ needs.environment-preparation.outputs.version }}-dev" >> $GITHUB_OUTPUT
+          else
+            echo "base_tag=${{ needs.environment-preparation.outputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push base image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build-mdcx/Dockerfile.build-mdcx-base
+          build-args: |
+            BASE_IMAGE_TAG=ubuntu-24.04-v4
+            PYPI_MIRROR=${{ env.PYPI_MIRROR }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/build-mdcx-base:${{ steps.build-args.outputs.base_tag }}
+            ${{ env.DOCKERHUB_USERNAME }}/build-mdcx-base:${{ needs.environment-preparation.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ========================================================================
+  # Job 5: 构建 Docker 镜像 - Build MDCx
+  # ========================================================================
+  build-mdcx:
+    name: 🏗️ Build MDCx Binary Image
+    runs-on: ubuntu-latest
+    needs: [environment-preparation, build-base]
+    if: |
+      needs.environment-preparation.outputs.should_continue == 'true' &&
+      needs.environment-preparation.outputs.skip_build != 'true'
+
+    outputs:
+      bin_image_tag: ${{ steps.build.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare source
+        run: |
+          bash prepare-src.sh --context .mdcx_src --repo Hazard804/mdcx --tag latest
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push bin image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build-mdcx/Dockerfile.build-mdcx
+          build-args: |
+            BASE_IMAGE_TAG=${{ needs.build-base.outputs.build_version }}
+            MDCX_SRC_TAG=daily_release
+            MDCX_SRC_REPO=Hazard804/mdcx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/build-mdcx:${{ needs.environment-preparation.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ========================================================================
+  # Job 6: 构建 Docker 镜像 - GUI Base
+  # ========================================================================
+  build-gui-base:
+    name: 🏗️ Build GUI Base Image
+    runs-on: ubuntu-latest
+    needs: [environment-preparation, build-mdcx]
+    if: |
+      needs.environment-preparation.outputs.should_continue == 'true' &&
+      needs.environment-preparation.outputs.skip_build != 'true'
+
+    outputs:
+      gui_base_tag: ${{ steps.build.outputs.tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push GUI base image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: gui-base/Dockerfile.gui-base
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/gui-base:${{ needs.environment-preparation.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ========================================================================
+  # Job 7: 构建最终镜像 - MDCx Builtin GUI Base
+  # ========================================================================
+  build-mdcx-builtin:
+    name: 🎯 Build MDCx Builtin GUI Base (Final)
+    runs-on: ubuntu-latest
+    needs: [environment-preparation, build-mdcx, build-gui-base]
+    if: |
+      needs.environment-preparation.outputs.should_continue == 'true' &&
+      needs.environment-preparation.outputs.skip_build != 'true'
+
+    outputs:
+      final_image: ${{ steps.build.outputs.image }}
+      final_tag: ${{ needs.environment-preparation.outputs.version }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push final image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: gui-base/Dockerfile.mdcx-builtin-gui-base
+          build-args: |
+            MDCX_BIN_IMAGE_TAG=${{ needs.environment-preparation.outputs.version }}
+            BASE_IMAGE_TAG=${{ needs.environment-preparation.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.DOCKERHUB_USERNAME }}/mdcx-builtin-gui-base:${{ needs.environment-preparation.outputs.version }}
+            ${{ env.DOCKERHUB_USERNAME }}/mdcx-builtin-gui-base:vsmeta-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image digest
+        run: |
+          echo "Image built successfully!"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+          echo "Image: ${{ steps.build.outputs.image }}"
+
+  # ========================================================================
+  # Job 8: 镜像验证和测试
+  # ========================================================================
+  verify-image:
+    name: ✅ Verify Built Image
+    runs-on: ubuntu-latest
+    needs: build-mdcx-builtin
+    if: needs.build-mdcx-builtin.outputs.final_image != ''
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Pull and inspect image
+        run: |
+          echo "检查镜像 ${{ needs.build-mdcx-builtin.outputs.final_image }}@${{ needs.build-mdcx-builtin.outputs.digest }}"
+
+          docker buildx imagetools inspect ${{ needs.build-mdcx-builtin.outputs.final_image }}:${{ needs.build-mdcx-builtin.outputs.final_tag }}
+
+      - name: Test run container
+        run: |
+          echo "启动测试容器..."
+          docker run -d --name mdcx-vsmeta-test \
+            ${{ needs.build-mdcx-builtin.outputs.final_image }}:${{ needs.build-mdcx-builtin.outputs.final_tag }}
+
+          sleep 5
+
+          echo "检查容器状态..."
+          docker ps -a | grep mdcx-vsmeta-test
+
+          echo "测试版本信息..."
+          docker exec mdcx-vsmeta-test cat /app-version || echo "版本文件不存在，可能正常"
+
+          echo "清理测试容器..."
+          docker stop mdcx-vsmeta-test || true
+          docker rm mdcx-vsmeta-test || true
+
+  # ========================================================================
+  # Job 9: 创建 GitHub Release
+  # ========================================================================
+  create-github-release:
+    name: 📦 Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [environment-preparation, verify-image]
+    if: |
+      needs.environment-preparation.outputs.environment == 'prod' &&
+      github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate release notes
+        id: release-notes
+        run: |
+          cat > release-notes.md << 'EOF'
+          # 🎉 MDCx VSMETA 功能发布
+
+          ## 新功能：群晖 Video Station VSMETA 支持
+
+          本次发布为 MDCx 添加了完整的群晖 Video Station VSMETA 元数据生成支持！
+
+          ### ✨ 新增功能
+
+          - 🆕 **VSMETA 编码器** - 完整的二进制格式编码实现
+          - 🆕 **默认启用** - 在默认配置中已启用，开箱即用
+          - 🆕 **海报嵌入** - 将下载的海报和背景图嵌入 VSMETA 文件
+          - 🆕 **与 NFO 协同** - 同时生成两种格式，兼容所有系统
+
+          ### 📝 主要变更
+
+          - 新增 `mdcx/core/vsmeta.py` - VSMETA 编码器模块
+          - 新增测试用例 - 完整的单元测试覆盖
+          - 配置优化 - 默认启用 VSMETA 功能
+
+          ### 🐳 Docker 镜像
+
+          镜像标签: `${{ needs.environment-preparation.outputs.version }}`
+
+          使用示例:
+          ```bash
+          docker pull ${{ env.DOCKERHUB_USERNAME }}/mdcx-builtin-gui-base:${{ needs.environment-preparation.outputs.version }}
+          ```
+
+          ### 📖 详细文档
+
+          请参考项目文档了解更多使用方法。
+
+          ---
+          *此版本由 GitHub Actions 自动构建发布*
+          EOF
+
+          echo "release_notes_file=release-notes.md" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.release-notes.outputs.release_notes_file }}
+          draft: false
+          prerelease: ${{ needs.environment-preparation.outputs.environment == 'dev' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ========================================================================
+  # Job 10: 通知和完成
+  # ========================================================================
+  notify:
+    name: 📢 Notification
+    runs-on: ubuntu-latest
+    needs: [environment-preparation, build-mdcx-builtin, verify-image]
+    if: always()
+
+    steps:
+      - name: Prepare notification message
+        id: message
+        run: |
+          if [[ "${{ needs.build-mdcx-builtin.result }}" == "success" ]]; then
+            echo "status=🎉 成功" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+          else
+            echo "status=❌ 失败" >> $GITHUB_OUTPUT
+            echo "emoji=🚨" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Telegram notification
+        if: vars.ENABLE_TG_NOTIFICATION == 'true'
+        uses: appleboy/telegram-action@v0.2.1
+        with:
+          to: ${{ secrets.TELE_CHAT_ID }}
+          token: ${{ secrets.TELE_BOT_TOKEN }}
+          message: |
+            🎬 MDCx VSMETA CI/CD 完成
+
+            ${{ needs.notify.outputs.status }}
+
+            📋 Job: Build and Publish VSMETA Images
+            🏷️ Tag: ${{ needs.environment-preparation.outputs.version }}
+            🌐 Environment: ${{ needs.environment-preparation.outputs.environment }}
+            👤 Triggered by: ${{ github.actor }}
+
+            📦 最终镜像:
+            `${{ env.DOCKERHUB_USERNAME }}/mdcx-builtin-gui-base:${{ needs.environment-preparation.outputs.version }}`
+
+            🔗 工作流: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Display completion summary
+        run: |
+          echo "========================================="
+          echo "  🎯 MDCx VSMETA CI/CD 执行完成"
+          echo "========================================="
+          echo ""
+          echo "状态: ${{ needs.notify.outputs.status }}"
+          echo "版本: ${{ needs.environment-preparation.outputs.version }}"
+          echo "环境: ${{ needs.environment-preparation.outputs.environment }}"
+          echo ""
+          echo "📦 镜像列表:"
+          echo "  - build-mdcx-base:${{ needs.environment-preparation.outputs.version }}"
+          echo "  - build-mdcx:${{ needs.environment-preparation.outputs.version }}"
+          echo "  - gui-base:${{ needs.environment-preparation.outputs.version }}"
+          echo "  - mdcx-builtin-gui-base:${{ needs.environment-preparation.outputs.version }}"
+          echo ""
+          echo "🔗 Docker Hub:"
+          echo "  https://hub.docker.com/u/${{ env.DOCKERHUB_USERNAME }}"
+          echo ""
+          echo "========================================="
